@@ -1,0 +1,217 @@
+name: Build Editor native (ONNX Runtime + infer)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download ONNX Runtime Android AAR
+        run: |
+          curl -fL -o ort.aar https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.23.2/onnxruntime-android-1.23.2.aar
+          mkdir ort
+          cd ort
+          unzip -q ../ort.aar
+          ls headers
+          ls -l jni/arm64-v8a
+
+      - name: Write infer.cpp
+        run: |
+          cat > infer.cpp <<'EOF'
+          #include <onnxruntime_cxx_api.h>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <cstdint>
+          #include <string>
+          #include <vector>
+          #include <iostream>
+          #include <sstream>
+          #include <stdexcept>
+
+          static void reply(const std::string& s) {
+            fputs(s.c_str(), stdout);
+            fputc('\n', stdout);
+            fflush(stdout);
+          }
+
+          static long rssKb() {
+            FILE* f = fopen("/proc/self/status", "r");
+            if (!f) return -1;
+            char line[256];
+            long kb = -1;
+            while (fgets(line, sizeof line, f)) {
+              if (strncmp(line, "VmRSS:", 6) == 0) { kb = atol(line + 6); break; }
+            }
+            fclose(f);
+            return kb;
+          }
+
+          static uint16_t f2h(float f) {
+            uint32_t x;
+            memcpy(&x, &f, 4);
+            uint32_t sign = (x >> 16) & 0x8000;
+            int32_t exp = (int32_t)((x >> 23) & 0xff) - 127 + 15;
+            uint32_t mant = x & 0x7fffff;
+            if (exp <= 0) {
+              if (exp < -10) return (uint16_t)sign;
+              mant = (mant | 0x800000) >> (1 - exp);
+              if (mant & 0x1000) mant += 0x2000;
+              return (uint16_t)(sign | (mant >> 13));
+            } else if (exp >= 31) {
+              return (uint16_t)(sign | 0x7c00);
+            }
+            if (mant & 0x1000) {
+              mant += 0x2000;
+              if (mant & 0x800000) { mant = 0; exp++; if (exp >= 31) return (uint16_t)(sign | 0x7c00); }
+            }
+            return (uint16_t)(sign | (exp << 10) | (mant >> 13));
+          }
+
+          static float h2f(uint16_t h) {
+            uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+            uint32_t exp = (h >> 10) & 0x1f;
+            uint32_t mant = h & 0x3ff;
+            uint32_t x;
+            if (exp == 0) {
+              if (mant == 0) x = sign;
+              else {
+                exp = 127 - 15 + 1;
+                while (!(mant & 0x400)) { mant <<= 1; exp--; }
+                mant &= 0x3ff;
+                x = sign | (exp << 23) | (mant << 13);
+              }
+            } else if (exp == 31) {
+              x = sign | 0x7f800000 | (mant << 13);
+            } else {
+              x = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+            }
+            float f;
+            memcpy(&f, &x, 4);
+            return f;
+          }
+
+          int main(int argc, char** argv) {
+            if (argc < 2) { reply("ERR usage"); return 1; }
+            int threads = argc > 2 ? atoi(argv[2]) : 2;
+            if (threads < 1) threads = 1;
+            try {
+              Ort::Env env(ORT_LOGGING_LEVEL_ERROR, "editor");
+              Ort::SessionOptions so;
+              so.SetIntraOpNumThreads(threads);
+              so.SetInterOpNumThreads(1);
+              so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+              so.DisableMemPattern();
+              so.DisableCpuMemArena();
+              Ort::Session session(env, argv[1], so);
+              Ort::AllocatorWithDefaultOptions alloc;
+              Ort::AllocatedStringPtr inName = session.GetInputNameAllocated(0, alloc);
+              Ort::AllocatedStringPtr outName = session.GetOutputNameAllocated(0, alloc);
+              const char* inNames[1] = { inName.get() };
+              const char* outNames[1] = { outName.get() };
+
+              Ort::TypeInfo ti = session.GetInputTypeInfo(0);
+              auto tinfo = ti.GetTensorTypeAndShapeInfo();
+              std::vector<int64_t> shp = tinfo.GetShape();
+              ONNXTensorElementDataType itype = tinfo.GetElementType();
+              long long d[4] = {0, 0, 0, 0};
+              for (size_t i = 0; i < 4 && i < shp.size(); i++) d[i] = shp[i] > 0 ? shp[i] : 0;
+              char buf[256];
+              snprintf(buf, sizeof buf, "READY %lld %lld %lld %lld %ld", d[0], d[1], d[2], d[3], rssKb());
+              reply(buf);
+
+              std::string line;
+              while (std::getline(std::cin, line)) {
+                if (line == "QUIT") break;
+                std::istringstream is(line);
+                std::string cmd;
+                is >> cmd;
+                if (cmd == "MEM") { reply("MEM " + std::to_string(rssKb())); continue; }
+                if (cmd != "RUN") { reply("ERR unknown command"); continue; }
+                std::string inPath, outPath;
+                long long n = 0, c = 0, h = 0, w = 0;
+                is >> inPath >> outPath >> n >> c >> h >> w;
+                try {
+                  size_t count = (size_t)(n * c * h * w);
+                  std::vector<float> in(count);
+                  FILE* f = fopen(inPath.c_str(), "rb");
+                  if (!f) throw std::runtime_error("input file open fail");
+                  size_t got = fread(in.data(), sizeof(float), count, f);
+                  fclose(f);
+                  if (got != count) throw std::runtime_error("input file short");
+
+                  std::vector<int64_t> dims = {n, c, h, w};
+                  Ort::MemoryInfo mi = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+                  std::vector<uint16_t> half;
+                  Ort::Value tensor{nullptr};
+                  if (itype == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+                    half.resize(count);
+                    for (size_t i = 0; i < count; i++) half[i] = f2h(in[i]);
+                    tensor = Ort::Value::CreateTensor(mi, half.data(), count * sizeof(uint16_t),
+                                                      dims.data(), dims.size(),
+                                                      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16);
+                  } else {
+                    tensor = Ort::Value::CreateTensor<float>(mi, in.data(), count, dims.data(), dims.size());
+                  }
+
+                  auto outs = session.Run(Ort::RunOptions{nullptr}, inNames, &tensor, 1, outNames, 1);
+                  auto oi = outs[0].GetTensorTypeAndShapeInfo();
+                  std::vector<int64_t> os = oi.GetShape();
+                  size_t ocount = oi.GetElementCount();
+                  ONNXTensorElementDataType otype = oi.GetElementType();
+                  std::vector<float> res(ocount);
+                  if (otype == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+                    const float* p = outs[0].GetTensorData<float>();
+                    for (size_t i = 0; i < ocount; i++) res[i] = p[i];
+                  } else if (otype == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+                    const uint16_t* p = (const uint16_t*)outs[0].GetTensorRawData();
+                    for (size_t i = 0; i < ocount; i++) res[i] = h2f(p[i]);
+                  } else {
+                    throw std::runtime_error("unsupported output type");
+                  }
+
+                  FILE* fo = fopen(outPath.c_str(), "wb");
+                  if (!fo) throw std::runtime_error("output file open fail");
+                  fwrite(res.data(), sizeof(float), ocount, fo);
+                  fclose(fo);
+
+                  std::string r = "OK " + std::to_string(rssKb()) + " " + std::to_string(os.size());
+                  for (size_t i = 0; i < os.size(); i++) r += " " + std::to_string((long long)os[i]);
+                  reply(r);
+                } catch (const std::exception& e) {
+                  std::string m = e.what();
+                  for (size_t i = 0; i < m.size(); i++) if (m[i] == '\n' || m[i] == '\r') m[i] = ' ';
+                  reply("ERR " + m);
+                }
+              }
+            } catch (const std::exception& e) {
+              std::string m = e.what();
+              for (size_t i = 0; i < m.size(); i++) if (m[i] == '\n' || m[i] == '\r') m[i] = ' ';
+              reply("ERR " + m);
+              return 1;
+            }
+            return 0;
+          }
+          EOF
+
+      - name: Compile for Android arm64
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          mkdir out
+          "$BIN/aarch64-linux-android28-clang++" -std=c++17 -O2 -fPIE -pie -static-libstdc++ \
+            -I ort/headers infer.cpp -L ort/jni/arm64-v8a -lonnxruntime -llog \
+            -o out/libeditor_infer.so
+          cp ort/jni/arm64-v8a/libonnxruntime.so out/
+          if readelf -d ort/jni/arm64-v8a/libonnxruntime.so | grep -q 'libc++_shared'; then
+            cp "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" out/
+          fi
+          readelf -d out/libeditor_infer.so | grep NEEDED
+          ls -l out
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: editor_native
+          path: out/
